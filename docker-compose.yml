@@ -1,0 +1,13 @@
+version: '3.9'
+services:
+  openclaw-clone:
+    build: .
+    container_name: openclaw-clone
+    tty: true
+    stdin_open: true
+    volumes:
+      - openclaw_clone_home:/root/.openclaw
+    working_dir: /root
+    command: ["sleep", "infinity"]
+volumes:
+  openclaw_clone_home:
