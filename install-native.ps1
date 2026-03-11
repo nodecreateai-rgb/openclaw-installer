@@ -14,9 +14,6 @@ $MonitorName = if ($env:AGILE_CODEX_MONITOR_NAME) { $env:AGILE_CODEX_MONITOR_NAM
 $MonitorChannel = $env:AGILE_CODEX_MONITOR_CHANNEL
 $MonitorTo = $env:AGILE_CODEX_MONITOR_TO
 $MonitorAccount = $env:AGILE_CODEX_MONITOR_ACCOUNT
-$BUNDLED_BROWSER_USE_DIR = if ($env:BUNDLED_BROWSER_USE_DIR) { $env:BUNDLED_BROWSER_USE_DIR } else { Join-Path $ScriptDir 'bundled-services/docker-browser-use' }
-$BROWSER_USE_INSTALL_DIR = if ($env:BROWSER_USE_INSTALL_DIR) { $env:BROWSER_USE_INSTALL_DIR } else { Join-Path $HOME '.openclaw/services/docker-browser-use' }
-$BROWSER_USE_HEALTH_URL = if ($env:BROWSER_USE_HEALTH_URL) { $env:BROWSER_USE_HEALTH_URL } else { 'http://127.0.0.1:8080/healthz' }
 $FeishuPluginSpec = if ($env:FEISHU_PLUGIN_SPEC) { $env:FEISHU_PLUGIN_SPEC } else { '@m1heng-clawd/feishu' }
 
 function Need-Bin($Name) {
