@@ -1,0 +1,35 @@
+services:
+  tenant-openclaw:
+    build:
+      context: ..
+      dockerfile: tenant-mode/Dockerfile
+    container_name: ${TENANT_CONTAINER_NAME}
+    restart: unless-stopped
+    shm_size: "1gb"
+    environment:
+      TENANT_BASE_URL: ${TENANT_BASE_URL}
+      TENANT_API_KEY: ${TENANT_API_KEY}
+      TENANT_MODEL: ${TENANT_MODEL}
+      TENANT_FEISHU_APP_ID: ${TENANT_FEISHU_APP_ID}
+      TENANT_FEISHU_APP_SECRET: ${TENANT_FEISHU_APP_SECRET}
+      TENANT_VNC_PASSWORD: ${TENANT_VNC_PASSWORD}
+      TENANT_PROXY_MODE: ${TENANT_PROXY_MODE}
+      OPENCLAW_GATEWAY_BIND: ${OPENCLAW_GATEWAY_BIND}
+      OPENCLAW_GATEWAY_ALLOWED_ORIGINS_JSON: ${OPENCLAW_GATEWAY_ALLOWED_ORIGINS_JSON}
+      OPENCLAW_GATEWAY_PORT: ${OPENCLAW_GATEWAY_PORT}
+      DISPLAY: ":99"
+      SCREEN_WIDTH: "1920"
+      SCREEN_HEIGHT: "1080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${TENANT_GATEWAY_PORT}:18789"
+      - "${TENANT_VNC_PORT}:5900"
+    volumes:
+      - ${TENANT_DATA_DIR}:/root/.openclaw
+    healthcheck:
+      test: ["CMD-SHELL", "[ ! -f /tmp/tenant-ready ] && exit 0; [ -f /root/.openclaw/TENANT_DISABLED ] && exit 1; openclaw gateway health >/tmp/tenant-healthcheck.log 2>&1" ]
+      interval: 15s
+      timeout: 10s
+      retries: 2
+      start_period: 30s

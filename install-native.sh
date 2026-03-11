@@ -15,6 +15,23 @@ AGILE_CODEX_MONITOR_CHANNEL="${AGILE_CODEX_MONITOR_CHANNEL:-}"
 AGILE_CODEX_MONITOR_TO="${AGILE_CODEX_MONITOR_TO:-}"
 AGILE_CODEX_MONITOR_ACCOUNT="${AGILE_CODEX_MONITOR_ACCOUNT:-}"
 FEISHU_PLUGIN_SPEC="${FEISHU_PLUGIN_SPEC:-@m1heng-clawd/feishu}"
+INSTALL_MODE="${INSTALL_MODE:-}"
+TENANT_NONINTERACTIVE="${TENANT_NONINTERACTIVE:-0}"
+TENANT_PROXY_MODE="${TENANT_PROXY_MODE:-}"
+TENANT_DURATION_LABEL="${TENANT_DURATION_LABEL:-}"
+TENANT_BASE_URL="${TENANT_BASE_URL:-}"
+TENANT_API_KEY="${TENANT_API_KEY:-}"
+TENANT_MODEL="${TENANT_MODEL:-}"
+TENANT_FEISHU_APP_ID="${TENANT_FEISHU_APP_ID:-}"
+TENANT_FEISHU_APP_SECRET="${TENANT_FEISHU_APP_SECRET:-}"
+TENANT_VNC_PASSWORD="${TENANT_VNC_PASSWORD:-}"
+TENANT_HOST_BASE_URL="${TENANT_HOST_BASE_URL:-}"
+TENANT_HOST_API_KEY="${TENANT_HOST_API_KEY:-}"
+TENANT_HOST_MODEL="${TENANT_HOST_MODEL:-}"
+TENANT_READY_TIMEOUT_SECONDS="${TENANT_READY_TIMEOUT_SECONDS:-1800}"
+OPENCLAW_GATEWAY_BIND="${OPENCLAW_GATEWAY_BIND:-}"
+OPENCLAW_GATEWAY_ALLOWED_ORIGINS_JSON="${OPENCLAW_GATEWAY_ALLOWED_ORIGINS_JSON:-}"
+OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-18789}"
 
 need_bin() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -27,6 +44,10 @@ prompt() {
   local label="$1"
   local default="${2-}"
   local value
+  if [[ "$TENANT_NONINTERACTIVE" == "1" ]]; then
+    printf '%s' "$default"
+    return 0
+  fi
   if [[ -n "$default" ]]; then
     read -r -p "$label [$default]: " value || true
     printf '%s' "${value:-$default}"
@@ -34,6 +55,52 @@ prompt() {
     read -r -p "$label: " value || true
     printf '%s' "$value"
   fi
+}
+
+choose_install_mode() {
+  if [[ -n "$INSTALL_MODE" ]]; then
+    printf '%s' "$INSTALL_MODE"
+    return 0
+  fi
+  local mode
+  mode="$(prompt '选择模式：网管(admin) / 租户(tenant)' 'admin')"
+  case "$mode" in
+    admin|网管|guanli) printf 'admin' ;;
+    tenant|租户) printf 'tenant' ;;
+    *) printf 'admin' ;;
+  esac
+}
+
+choose_tenant_duration() {
+  if [[ -n "$TENANT_DURATION_LABEL" ]]; then
+    printf '%s' "$TENANT_DURATION_LABEL"
+    return 0
+  fi
+  prompt '租户时长：1h / 2h / 5h / 1m' '1h'
+}
+
+tenant_duration_seconds() {
+  case "$1" in
+    1h|1hour|1小时) echo 3600 ;;
+    2h|2hours|2小时) echo 7200 ;;
+    5h|5hours|5小时) echo 18000 ;;
+    1m|1month|1个月) echo 2592000 ;;
+    *) echo 3600 ;;
+  esac
+}
+
+choose_tenant_model_mode() {
+  if [[ "$TENANT_PROXY_MODE" == "proxy" || "$TENANT_PROXY_MODE" == "custom" ]]; then
+    printf '%s' "$TENANT_PROXY_MODE"
+    return 0
+  fi
+  local mode
+  mode="$(prompt '租户模型来源：代理(proxy) / 自定义(custom)' 'proxy')"
+  case "$mode" in
+    proxy|代理) printf 'proxy' ;;
+    custom|自定义) printf 'custom' ;;
+    *) printf 'proxy' ;;
+  esac
 }
 
 is_linux() { [[ "$(uname -s)" == "Linux" ]]; }
@@ -184,6 +251,160 @@ docker_compose_cmd() {
     return 0
   fi
   return 1
+}
+
+spawn_detached() {
+  local command_string="$1"
+  if command -v setsid >/dev/null 2>&1; then
+    setsid sh -c "exec $command_string" </dev/null >/dev/null 2>&1 &
+  else
+    nohup sh -c "exec $command_string" >/dev/null 2>&1 &
+  fi
+  echo $!
+}
+
+stop_pid_file() {
+  local pid_file="$1"
+  if [[ ! -f "$pid_file" ]]; then
+    return 0
+  fi
+  local pid
+  pid="$(cat "$pid_file" 2>/dev/null || true)"
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+  fi
+  rm -f "$pid_file"
+}
+
+systemd_unit_key() {
+  python3 - "$1" <<'PY'
+import re
+import sys
+
+value = re.sub(r'[^A-Za-z0-9]+', '-', sys.argv[1]).strip('-').lower()
+print(value or 'tenant')
+PY
+}
+
+json_array() {
+  python3 - "$@" <<'PY'
+import json
+import sys
+
+print(json.dumps(sys.argv[1:], ensure_ascii=False))
+PY
+}
+
+find_free_port() {
+  python3 - <<'PY'
+import socket
+
+sock = socket.socket()
+sock.bind(('', 0))
+print(sock.getsockname()[1])
+sock.close()
+PY
+}
+
+wait_for_tcp_port() {
+  local host="$1"
+  local port="$2"
+  local attempts="${3:-30}"
+  local delay_sec="${4:-1}"
+  local i
+  for ((i=1; i<=attempts; i++)); do
+    if python3 - <<PY >/dev/null 2>&1
+import socket
+sock = socket.socket()
+sock.settimeout(1)
+sock.connect((${host@Q}, int(${port@Q})))
+sock.close()
+PY
+    then
+      return 0
+    fi
+    sleep "$delay_sec"
+  done
+  return 1
+}
+
+wait_for_tenant_ready() {
+  local container_name="$1"
+  local timeout_seconds="$2"
+  local poll_interval=5
+  local waited=0
+  while (( waited < timeout_seconds )); do
+    local status
+    status="$(docker inspect -f '{{.State.Status}}' "$container_name" 2>/dev/null || true)"
+    case "$status" in
+      running|created|restarting|"")
+        ;;
+      *)
+        echo "tenant container entered unexpected state: ${status:-missing}" >&2
+        docker logs --tail 200 "$container_name" >&2 || true
+        return 1
+        ;;
+    esac
+    if docker exec "$container_name" test -f /tmp/tenant-ready >/dev/null 2>&1 \
+      && docker exec "$container_name" openclaw gateway health >/tmp/tenant-gateway-health.log 2>&1; then
+      return 0
+    fi
+    sleep "$poll_interval"
+    waited=$((waited + poll_interval))
+  done
+  echo "timed out waiting for tenant container to finish installation" >&2
+  docker logs --tail 200 "$container_name" >&2 || true
+  return 1
+}
+
+write_tenant_state() {
+  local state_file="$1"
+  local tenant_name="$2"
+  local container_name="$3"
+  local duration_label="$4"
+  local duration_seconds="$5"
+  local model_mode="$6"
+  local gateway_port="$7"
+  local vnc_port="$8"
+  local data_dir="$9"
+  local proxy_port="${10}"
+  local created_at="${11}"
+  local expires_at="${12}"
+  local vnc_password="${13}"
+  local expiry_mode="${14}"
+  local expiry_unit="${15}"
+  python3 - <<PY
+import json
+from pathlib import Path
+
+payload = {
+  'tenant': ${tenant_name@Q},
+  'container': ${container_name@Q},
+  'durationLabel': ${duration_label@Q},
+  'durationSeconds': int(${duration_seconds@Q}),
+  'modelMode': ${model_mode@Q},
+  'gatewayPort': int(${gateway_port@Q}),
+  'vncPort': int(${vnc_port@Q}),
+  'dataDir': ${data_dir@Q},
+  'createdAt': ${created_at@Q},
+  'expiresAt': ${expires_at@Q},
+  'vncPassword': ${vnc_password@Q},
+}
+proxy_port = ${proxy_port@Q}
+if proxy_port:
+  payload['proxyPort'] = int(proxy_port)
+expiry_mode = ${expiry_mode@Q}
+if expiry_mode:
+  payload['expiryMode'] = expiry_mode
+expiry_unit = ${expiry_unit@Q}
+if expiry_unit:
+  payload['expiryUnit'] = expiry_unit
+path = Path(${state_file@Q})
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + '\n')
+print(path)
+PY
 }
 
 install_openclaw() {
@@ -361,6 +582,9 @@ PY
 }
 
 write_openclaw_config() {
+  local gateway_bind="${OPENCLAW_GATEWAY_BIND:-loopback}"
+  local gateway_allowed_origins_json="${OPENCLAW_GATEWAY_ALLOWED_ORIGINS_JSON:-}"
+  local gateway_port="${OPENCLAW_GATEWAY_PORT:-18789}"
   python3 - <<PY
 import json
 from pathlib import Path
@@ -370,6 +594,9 @@ workspace = ${WORKSPACE@Q}
 base_url = ${BASE_URL@Q}
 api_key = ${API_KEY@Q}
 model_name = ${MODEL_NAME@Q}
+gateway_bind = ${gateway_bind@Q}
+gateway_allowed_origins_json = ${gateway_allowed_origins_json@Q}
+gateway_port = int(${gateway_port@Q})
 cfg = json.loads(cfg_path.read_text())
 provider_cfg = cfg.setdefault('models', {}).setdefault('providers', {}).setdefault(provider, {})
 cfg['models']['mode'] = 'merge'
@@ -412,12 +639,19 @@ skills.setdefault('using-superpowers', {})['enabled'] = True
 skills.setdefault('agile-codex', {})['enabled'] = True
 skills.setdefault('browser-use', {})['enabled'] = True
 gateway = cfg.setdefault('gateway', {})
-gateway.setdefault('port', 18789)
+gateway['port'] = gateway_port
 gateway['mode'] = 'local'
-gateway['bind'] = 'loopback'
-gateway.setdefault('controlUi', {})['allowedOrigins'] = [
-  'http://localhost:18789', 'http://127.0.0.1:18789'
-]
+gateway['bind'] = gateway_bind
+try:
+  allowed_origins = json.loads(gateway_allowed_origins_json) if gateway_allowed_origins_json else []
+except Exception:
+  allowed_origins = []
+if not isinstance(allowed_origins, list) or not allowed_origins:
+  allowed_origins = [
+    f'http://localhost:{gateway_port}',
+    f'http://127.0.0.1:{gateway_port}',
+  ]
+gateway.setdefault('controlUi', {})['allowedOrigins'] = allowed_origins
 gateway.setdefault('auth', {})['mode'] = 'token'
 gateway['auth'].setdefault('token', 'openclaw-local-token')
 gateway.setdefault('tailscale', {})['mode'] = 'off'
@@ -534,8 +768,13 @@ print(((cfg.get('channels') or {}).get('feishu') or {}).get('appSecret', ''))
 PY
 )"
 
-  feishu_app_id="$(prompt 'Feishu appId' "$current_app_id")"
-  feishu_app_secret="$(prompt 'Feishu appSecret' "$current_app_secret")"
+  if [[ "$TENANT_NONINTERACTIVE" == "1" ]]; then
+    feishu_app_id="$TENANT_FEISHU_APP_ID"
+    feishu_app_secret="$TENANT_FEISHU_APP_SECRET"
+  else
+    feishu_app_id="$(prompt 'Feishu appId' "$current_app_id")"
+    feishu_app_secret="$(prompt 'Feishu appSecret' "$current_app_secret")"
+  fi
 
   openclaw config set channels.feishu.appId "\"${feishu_app_id}\""
   openclaw config set channels.feishu.appSecret "\"${feishu_app_secret}\""
@@ -553,6 +792,220 @@ feishu['allowFrom'] = ['*']
 cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + '\n')
 print('updated feishu channel settings in', cfg_path)
 PY
+}
+
+setup_host_model_proxy() {
+  local state_dir="$1"
+  local upstream_base="$2"
+  local upstream_key="$3"
+  local proxy_token="$4"
+  local proxy_port="$5"
+  local proxy_pid_file="$state_dir/proxy.pid"
+  local proxy_log_file="$state_dir/proxy.log"
+  mkdir -p "$state_dir"
+  stop_pid_file "$proxy_pid_file"
+  local proxy_cmd proxy_pid
+  printf -v proxy_cmd 'python3 %q --listen %q --port %q --upstream %q --api-key %q --require-bearer %q > %q 2>&1' \
+    "$SCRIPT_DIR/app-proxy/openai_proxy.py" \
+    "0.0.0.0" \
+    "$proxy_port" \
+    "$upstream_base" \
+    "$upstream_key" \
+    "$proxy_token" \
+    "$proxy_log_file"
+  proxy_pid="$(spawn_detached "$proxy_cmd")"
+  echo "$proxy_pid" > "$proxy_pid_file"
+  if ! wait_for_tcp_port "127.0.0.1" "$proxy_port" 30 1; then
+    echo "tenant proxy failed to start on port $proxy_port" >&2
+    [[ -f "$proxy_log_file" ]] && tail -n 80 "$proxy_log_file" >&2 || true
+    return 1
+  fi
+}
+
+setup_tenant_expiry() {
+  local container_name="$1"
+  local seconds="$2"
+  local state_dir="$3"
+  local expiry_log="$state_dir/expiry.log"
+  local expiry_mode_file="$state_dir/expiry.mode"
+  local expiry_unit_file="$state_dir/expiry.unit"
+  mkdir -p "$state_dir"
+  chmod 700 "$state_dir" 2>/dev/null || true
+  printf 'scheduled disable in %ss for %s\n' "$seconds" "$container_name" > "$expiry_log"
+  stop_pid_file "$state_dir/expiry.pid"
+  if [[ -f "$expiry_unit_file" ]] && have_systemd_user; then
+    local old_unit
+    old_unit="$(cat "$expiry_unit_file" 2>/dev/null || true)"
+    if [[ -n "$old_unit" ]]; then
+      systemctl --user stop "${old_unit}.timer" >/dev/null 2>&1 || true
+      systemctl --user stop "${old_unit}.service" >/dev/null 2>&1 || true
+      systemctl --user reset-failed "${old_unit}.timer" "${old_unit}.service" >/dev/null 2>&1 || true
+    fi
+    rm -f "$expiry_unit_file"
+  fi
+  rm -f "$expiry_mode_file"
+  if have_systemd_user && command -v systemd-run >/dev/null 2>&1; then
+    local systemd_unit
+    systemd_unit="openclaw-tenant-expire-$(systemd_unit_key "$container_name")"
+    if systemd-run --user \
+      --unit "$systemd_unit" \
+      --on-active "${seconds}s" \
+      --timer-property=AccuracySec=1s \
+      --collect \
+      bash \
+      "$SCRIPT_DIR/scripts/tenant-expire.sh" \
+      "$container_name" \
+      "0" \
+      "$state_dir" >"$state_dir/expiry-schedule.log" 2>&1; then
+      printf 'systemd-user\n' > "$expiry_mode_file"
+      printf '%s\n' "$systemd_unit" > "$expiry_unit_file"
+      return 0
+    fi
+    printf 'systemd-run failed, fallback to detached sleep\n' >> "$expiry_log"
+  fi
+  local expiry_cmd expiry_pid
+  printf -v expiry_cmd '%q %q %q %q %q > %q 2>&1' \
+    "bash" \
+    "$SCRIPT_DIR/scripts/tenant-expire.sh" \
+    "$container_name" \
+    "$seconds" \
+    "$state_dir" \
+    "$state_dir/expiry-run.log"
+  expiry_pid="$(spawn_detached "$expiry_cmd")"
+  echo "$expiry_pid" > "$state_dir/expiry.pid"
+  printf 'sleep-fallback\n' > "$expiry_mode_file"
+}
+
+run_tenant_mode() {
+  need_bin docker
+  local compose_cmd
+  compose_cmd="$(docker_compose_cmd)" || {
+    echo 'docker compose not available' >&2
+    exit 1
+  }
+  local duration_label duration_seconds model_mode tenant_name tenant_container tenant_gateway_port tenant_vnc_port tenant_data_dir tenant_state_dir tenant_proxy_token tenant_proxy_port tenant_vnc_password host_base host_key host_model effective_base effective_key effective_model tenant_allowed_origins_json created_at expires_at expiry_mode expiry_unit
+  duration_label="$(choose_tenant_duration)"
+  duration_seconds="$(tenant_duration_seconds "$duration_label")"
+  model_mode="$(choose_tenant_model_mode)"
+  tenant_name="tenant-$(date -u +%Y%m%d%H%M%S)-$(python3 - <<'PY'
+import secrets
+print(secrets.token_hex(2))
+PY
+)"
+  tenant_container="${tenant_name}-openclaw"
+  tenant_gateway_port="$(find_free_port)"
+  tenant_vnc_port="$(find_free_port)"
+  while [[ "$tenant_vnc_port" == "$tenant_gateway_port" ]]; do
+    tenant_vnc_port="$(find_free_port)"
+  done
+  tenant_data_dir="$HOME/.openclaw-tenants/${tenant_name}"
+  tenant_state_dir="$HOME/.openclaw/tenant-state/${tenant_name}"
+  mkdir -p "$tenant_data_dir" "$tenant_state_dir"
+  chmod 700 "$tenant_data_dir" "$tenant_state_dir" 2>/dev/null || true
+  tenant_vnc_password="${TENANT_VNC_PASSWORD:-$(python3 - <<'PY'
+import secrets
+import string
+
+alphabet = string.ascii_letters + string.digits
+print(''.join(secrets.choice(alphabet) for _ in range(8)))
+PY
+)}"
+
+  if [[ "$model_mode" == "proxy" ]]; then
+    mapfile -t CURRENT < <(current_values)
+    host_base="$(prompt '宿主 Base URL' "${TENANT_HOST_BASE_URL:-${CURRENT[0]}}")"
+    host_key="$(prompt '宿主 API key' "${TENANT_HOST_API_KEY:-${CURRENT[1]}}")"
+    host_model="$(prompt '宿主 Model name' "${TENANT_HOST_MODEL:-${CURRENT[2]}}")"
+    tenant_proxy_token="tenant-$(python3 - <<'PY'
+import secrets
+print(secrets.token_urlsafe(24))
+PY
+)"
+    tenant_proxy_port="$(find_free_port)"
+    while [[ "$tenant_proxy_port" == "$tenant_gateway_port" || "$tenant_proxy_port" == "$tenant_vnc_port" ]]; do
+      tenant_proxy_port="$(find_free_port)"
+    done
+    setup_host_model_proxy "$tenant_state_dir" "$host_base" "$host_key" "$tenant_proxy_token" "$tenant_proxy_port"
+    effective_base="http://host.docker.internal:${tenant_proxy_port}/v1"
+    effective_key="$tenant_proxy_token"
+    effective_model="$host_model"
+  else
+    effective_base="$(prompt '租户 Base URL' "$TENANT_BASE_URL")"
+    effective_key="$(prompt '租户 API key' "$TENANT_API_KEY")"
+    effective_model="$(prompt '租户 Model name' "${TENANT_MODEL:-gpt-5.4}")"
+  fi
+
+  local tenant_feishu_app_id tenant_feishu_app_secret
+  tenant_feishu_app_id="$(prompt '租户 Feishu appId' "$TENANT_FEISHU_APP_ID")"
+  tenant_feishu_app_secret="$(prompt '租户 Feishu appSecret' "$TENANT_FEISHU_APP_SECRET")"
+  tenant_allowed_origins_json="$(json_array \
+    "http://localhost:${tenant_gateway_port}" \
+    "http://127.0.0.1:${tenant_gateway_port}" \
+    "http://localhost:18789" \
+    "http://127.0.0.1:18789")"
+  export TENANT_CONTAINER_NAME="$tenant_container"
+  export TENANT_GATEWAY_PORT="$tenant_gateway_port"
+  export TENANT_VNC_PORT="$tenant_vnc_port"
+  export TENANT_DATA_DIR="$tenant_data_dir"
+  export TENANT_BASE_URL="$effective_base"
+  export TENANT_API_KEY="$effective_key"
+  export TENANT_MODEL="$effective_model"
+  export TENANT_FEISHU_APP_ID="$tenant_feishu_app_id"
+  export TENANT_FEISHU_APP_SECRET="$tenant_feishu_app_secret"
+  export TENANT_VNC_PASSWORD="$tenant_vnc_password"
+  export TENANT_PROXY_MODE="$model_mode"
+  export OPENCLAW_GATEWAY_BIND="lan"
+  export OPENCLAW_GATEWAY_ALLOWED_ORIGINS_JSON="$tenant_allowed_origins_json"
+  export OPENCLAW_GATEWAY_PORT="18789"
+
+  $compose_cmd -p "$tenant_name" -f "$SCRIPT_DIR/tenant-mode/docker-compose.yml" up -d --build
+  echo "waiting for tenant container to finish installation..."
+  if ! wait_for_tenant_ready "$tenant_container" "$TENANT_READY_TIMEOUT_SECONDS"; then
+    stop_pid_file "$tenant_state_dir/proxy.pid"
+    return 1
+  fi
+  created_at="$(date -u +%FT%TZ)"
+  expires_at="$(python3 - <<PY
+from datetime import datetime, timedelta, timezone
+
+created_at = datetime.strptime(${created_at@Q}, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
+print((created_at + timedelta(seconds=int(${duration_seconds@Q}))).strftime('%Y-%m-%dT%H:%M:%SZ'))
+PY
+)"
+  setup_tenant_expiry "$tenant_container" "$duration_seconds" "$tenant_state_dir"
+  expiry_mode="$(cat "$tenant_state_dir/expiry.mode" 2>/dev/null || true)"
+  expiry_unit="$(cat "$tenant_state_dir/expiry.unit" 2>/dev/null || true)"
+  write_tenant_state \
+    "$tenant_state_dir/tenant.json" \
+    "$tenant_name" \
+    "$tenant_container" \
+    "$duration_label" \
+    "$duration_seconds" \
+    "$model_mode" \
+    "$tenant_gateway_port" \
+    "$tenant_vnc_port" \
+    "$tenant_data_dir" \
+    "${tenant_proxy_port:-}" \
+    "$created_at" \
+    "$expires_at" \
+    "$tenant_vnc_password" \
+    "$expiry_mode" \
+    "$expiry_unit"
+
+  cat <<EOF
+租户模式已启动。
+- tenant: $tenant_name
+- container: $tenant_container
+- gateway ws port: $tenant_gateway_port
+- vnc port: $tenant_vnc_port
+- vnc password: $tenant_vnc_password
+- duration: $duration_label (${duration_seconds}s)
+- expires at (UTC): $expires_at
+- model mode: $model_mode
+- data dir: $tenant_data_dir
+- state dir: $tenant_state_dir
+- expiry scheduler: ${expiry_mode:-sleep-fallback}${expiry_unit:+ ($expiry_unit)}
+EOF
 }
 
 configure_agile_codex_runtime() {
@@ -817,6 +1270,13 @@ ensure_agent_state_dirs() {
 }
 
 main() {
+  local selected_mode
+  selected_mode="$(choose_install_mode)"
+  if [[ "$selected_mode" == "tenant" && "${1:-}" != "--tenant-container" ]]; then
+    run_tenant_mode
+    return 0
+  fi
+
   need_bin node
   need_bin npm
   need_bin python3
@@ -825,10 +1285,16 @@ main() {
   bootstrap_if_missing
   ensure_agent_state_dirs
 
-  mapfile -t CURRENT < <(current_values)
-  BASE_URL="$(prompt 'Base URL' "${CURRENT[0]}")"
-  API_KEY="$(prompt 'API key' "${CURRENT[1]}")"
-  MODEL_NAME="$(prompt 'Model name' "${CURRENT[2]}")"
+  if [[ "$TENANT_NONINTERACTIVE" == "1" ]]; then
+    BASE_URL="$TENANT_BASE_URL"
+    API_KEY="$TENANT_API_KEY"
+    MODEL_NAME="$TENANT_MODEL"
+  else
+    mapfile -t CURRENT < <(current_values)
+    BASE_URL="$(prompt 'Base URL' "${CURRENT[0]}")"
+    API_KEY="$(prompt 'API key' "${CURRENT[1]}")"
+    MODEL_NAME="$(prompt 'Model name' "${CURRENT[2]}")"
+  fi
 
   write_openclaw_config
   write_codex_config
