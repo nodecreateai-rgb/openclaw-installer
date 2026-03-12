@@ -11,10 +11,14 @@ TEST_REPO_ROOT() {
   return 0
 }
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_SOURCE="${BASH_SOURCE[0]-}"
+ROOT=""
+if [[ -n "$SCRIPT_SOURCE" && -e "$SCRIPT_SOURCE" ]]; then
+  ROOT="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+fi
 REPO_ROOT=""
 
-if TEST_REPO_ROOT "$ROOT"; then
+if [[ -n "$ROOT" ]] && TEST_REPO_ROOT "$ROOT"; then
   REPO_ROOT="$ROOT"
 else
   ARCHIVE_URL="${OPENCLAW_INSTALLER_ARCHIVE_URL:-https://github.com/nodecreateai-rgb/openclaw-installer/archive/refs/heads/main.tar.gz}"
