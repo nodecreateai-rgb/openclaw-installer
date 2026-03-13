@@ -22,7 +22,8 @@ if [[ -z "$tenant_name" ]]; then
   exit 1
 fi
 
-state_dir="$HOME/.openclaw/tenant-state/$tenant_name"
+tenant_state_root="${DOPE_TENANT_STATE_ROOT:-${OPENCLAW_TENANT_STATE_ROOT:-$HOME/.openclaw/tenant-state}}"
+state_dir="$tenant_state_root/$tenant_name"
 tenant_json="$state_dir/tenant.json"
 if [[ ! -f "$tenant_json" ]]; then
   echo "tenant state missing: $tenant_json" >&2

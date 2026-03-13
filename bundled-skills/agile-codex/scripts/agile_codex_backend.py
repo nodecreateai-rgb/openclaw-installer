@@ -114,6 +114,54 @@ def parse_session_id_from_jsonl(path: Path):
     return None
 
 
+def jsonl_state_hints(path: Path):
+    if not path.exists():
+        return {
+            "last_event_type": "",
+            "last_payload_type": "",
+            "task_complete_event": False,
+        }
+    last_event_type = ""
+    last_payload_type = ""
+    task_complete_event = False
+    saw_object = False
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                saw_object = True
+                last_event_type = obj.get("type", "")
+                payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+                last_payload_type = payload.get("type", "") if isinstance(payload, dict) else ""
+                if obj.get("type") == "event_msg" and isinstance(payload, dict) and payload.get("type") == "task_complete":
+                    task_complete_event = True
+    except Exception:
+        return {
+            "last_event_type": "",
+            "last_payload_type": "",
+            "task_complete_event": False,
+        }
+    if not saw_object:
+        return {
+            "last_event_type": "",
+            "last_payload_type": "",
+            "task_complete_event": False,
+        }
+    return {
+        "last_event_type": last_event_type,
+        "last_payload_type": last_payload_type,
+        "task_complete_event": task_complete_event,
+    }
+
+
 def capture_tmux(session: str, tail_file: Path, snapshot_file: Path):
     subprocess.run(["tmux", "capture-pane", "-t", session, "-p", "-S", "-"], check=False, stdout=snapshot_file.open("w", encoding="utf-8"), stderr=subprocess.DEVNULL)
     write_tail(tail_file, tail_text(snapshot_file, max_chars=40000, max_lines=160))
@@ -226,6 +274,7 @@ def start_cmd(session_raw: str, workdir: str, prompt_file: str, log_dir_raw: str
         "report_grace_sec": report_grace_sec,
         "backend": backend,
     })
+    write_json(paths["meta_file"], meta)
 
     if backend == "tmux":
         if tmux_has_session(paths["session"]):
@@ -310,9 +359,13 @@ def status_cmd(session_raw: str, log_dir_raw: str):
     tail_text_value = tail_text(paths["tail_file"], max_chars=12000, max_lines=160)
     last_message_value = tail_text(paths["last_message_file"], max_chars=8000, max_lines=80)
     combined_text = "\n".join([tail_text_value, last_message_value])
+    jsonl_hints = jsonl_state_hints(paths["jsonl_file"])
     needs_input = detect_needs_input(combined_text)
-    completed = detect_completed(last_message_value)
+    completed = detect_completed(last_message_value) or jsonl_hints["task_complete_event"]
     idle_hint = detect_idle(combined_text)
+    abrupt_exit = state == "missing" and not completed and paths["jsonl_file"].exists()
+    if state == "missing" and completed:
+        state = "completed"
 
     started_at_epoch = int(meta.get("started_at_epoch") or 0)
     started_at = meta.get("started_at") or ""
@@ -376,6 +429,10 @@ def status_cmd(session_raw: str, log_dir_raw: str):
         "completed": completed,
         "active_work": active_work,
         "idle_hint": idle_hint,
+        "abrupt_exit": abrupt_exit,
+        "last_event_type": jsonl_hints["last_event_type"],
+        "last_payload_type": jsonl_hints["last_payload_type"],
+        "task_complete_event": jsonl_hints["task_complete_event"],
         "tail_file": str(paths["tail_file"]),
         "snapshot_file": str(paths["snapshot_file"]),
         "jsonl_file": str(paths["jsonl_file"]),
@@ -402,7 +459,13 @@ def status_cmd(session_raw: str, log_dir_raw: str):
         "summary_hash": summary_hash,
     }
     write_json(paths["status_file"], obj)
-    append_log(paths["event_log"], f"state={state} backend={backend} active_work={active_work} needs_input={needs_input} completed={completed} report_due={report_due} report_reason={report_reason} report_slot={report_slot}")
+    append_log(
+        paths["event_log"],
+        f"state={state} backend={backend} active_work={active_work} needs_input={needs_input} "
+        f"completed={completed} abrupt_exit={abrupt_exit} report_due={report_due} "
+        f"report_reason={report_reason} report_slot={report_slot} "
+        f"last_event_type={jsonl_hints['last_event_type']} last_payload_type={jsonl_hints['last_payload_type']}",
+    )
     print(json.dumps(obj, ensure_ascii=False, indent=2))
 
 

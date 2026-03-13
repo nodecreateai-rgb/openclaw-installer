@@ -8,6 +8,7 @@ CODEX_NPM_PACKAGE="${CODEX_NPM_PACKAGE:-@openai/codex@latest}"
 PROVIDER="default"
 WORKSPACE="${OPENCLAW_WORKSPACE:-$HOME/.openclaw}"
 SKILLS_DIR="$HOME/.openclaw/skills"
+HOOKS_DIR="$HOME/.openclaw/hooks"
 BUNDLED_SKILLS_DIR="${BUNDLED_SKILLS_DIR:-$SCRIPT_DIR/bundled-skills}"
 AGILE_CODEX_RUNTIME_DIR="${AGILE_CODEX_RUNTIME_DIR:-$SKILLS_DIR/agile-codex/runtime}"
 AGILE_CODEX_MONITOR_NAME="${AGILE_CODEX_MONITOR_NAME:-Agile Codex progress monitor}"
@@ -19,6 +20,8 @@ INSTALL_MODE="${INSTALL_MODE:-}"
 TENANT_NONINTERACTIVE="${TENANT_NONINTERACTIVE:-0}"
 TENANT_PROXY_MODE="${TENANT_PROXY_MODE:-}"
 TENANT_DURATION_LABEL="${TENANT_DURATION_LABEL:-}"
+TENANT_DURATION_SECONDS="${TENANT_DURATION_SECONDS:-}"
+TENANT_SHORT_UUID="${TENANT_SHORT_UUID:-}"
 TENANT_BASE_URL="${TENANT_BASE_URL:-}"
 TENANT_API_KEY="${TENANT_API_KEY:-}"
 TENANT_MODEL="${TENANT_MODEL:-}"
@@ -76,17 +79,93 @@ choose_tenant_duration() {
     printf '%s' "$TENANT_DURATION_LABEL"
     return 0
   fi
-  prompt '租户时长：1h / 2h / 5h / 1m' '1h'
+  prompt '租户时长，例如 1h / 2h / 3h / 1d / 1m' '1h'
 }
 
 tenant_duration_seconds() {
-  case "$1" in
-    1h|1hour|1小时) echo 3600 ;;
-    2h|2hours|2小时) echo 7200 ;;
-    5h|5hours|5小时) echo 18000 ;;
-    1m|1month|1个月) echo 2592000 ;;
-    *) echo 3600 ;;
-  esac
+  if [[ -n "$TENANT_DURATION_SECONDS" ]]; then
+    if [[ "$TENANT_DURATION_SECONDS" =~ ^[0-9]+$ ]] && (( TENANT_DURATION_SECONDS > 0 )); then
+      echo "$TENANT_DURATION_SECONDS"
+      return 0
+    fi
+    echo "invalid TENANT_DURATION_SECONDS: $TENANT_DURATION_SECONDS" >&2
+    return 1
+  fi
+  python3 - "$1" <<'PY'
+import re
+import sys
+
+raw = (sys.argv[1] or "").strip().lower()
+if not raw:
+    raise SystemExit("duration is required")
+
+for src, dst in (
+    ("个月", "mo"),
+    ("月", "mo"),
+    ("小时", "h"),
+    ("分钟", "min"),
+    ("分", "min"),
+    ("秒钟", "s"),
+    ("秒", "s"),
+    ("天", "d"),
+    ("周", "w"),
+):
+    raw = raw.replace(src, dst)
+normalized = re.sub(r"[\s,]+", "", raw)
+
+legacy = {
+    "1h": 3600,
+    "2h": 7200,
+    "5h": 18000,
+    "1m": 2592000,
+}
+if normalized in legacy:
+    print(legacy[normalized])
+    raise SystemExit(0)
+
+units = {
+    "s": 1,
+    "sec": 1,
+    "secs": 1,
+    "second": 1,
+    "seconds": 1,
+    "m": 60,
+    "min": 60,
+    "mins": 60,
+    "minute": 60,
+    "minutes": 60,
+    "h": 3600,
+    "hr": 3600,
+    "hrs": 3600,
+    "hour": 3600,
+    "hours": 3600,
+    "d": 86400,
+    "day": 86400,
+    "days": 86400,
+    "w": 604800,
+    "week": 604800,
+    "weeks": 604800,
+    "mo": 2592000,
+    "mon": 2592000,
+    "month": 2592000,
+    "months": 2592000,
+}
+matches = list(re.finditer(r"(\d+)([a-z]+)", normalized))
+if not matches or "".join(match.group(0) for match in matches) != normalized:
+    raise SystemExit(f"unsupported duration: {sys.argv[1]}")
+total = 0
+for match in matches:
+    amount = int(match.group(1))
+    unit = match.group(2)
+    if amount <= 0:
+        raise SystemExit(f"duration must be > 0: {sys.argv[1]}")
+    if unit not in units:
+        raise SystemExit(f"unsupported duration unit in: {sys.argv[1]}")
+    total += amount * units[unit]
+if total <= 0:
+    raise SystemExit(f"duration must be > 0: {sys.argv[1]}")
+print(total)
+PY
 }
 
 choose_tenant_model_mode() {
@@ -362,18 +441,22 @@ write_tenant_state() {
   local state_file="$1"
   local tenant_name="$2"
   local container_name="$3"
-  local duration_label="$4"
-  local duration_seconds="$5"
-  local model_mode="$6"
-  local gateway_port="$7"
-  local vnc_port="$8"
-  local data_dir="$9"
-  local proxy_port="${10}"
-  local created_at="${11}"
-  local expires_at="${12}"
-  local vnc_password="${13}"
-  local expiry_mode="${14}"
-  local expiry_unit="${15}"
+  local short_uuid="$4"
+  local duration_label="$5"
+  local duration_seconds="$6"
+  local model_mode="$7"
+  local gateway_port="$8"
+  local vnc_port="$9"
+  local data_dir="${10}"
+  local proxy_port="${11}"
+  local created_at="${12}"
+  local expires_at="${13}"
+  local vnc_password="${14}"
+  local expiry_mode="${15}"
+  local expiry_unit="${16}"
+  local public_base_url="${17}"
+  local public_model="${18}"
+  local feishu_app_id="${19}"
   python3 - <<PY
 import json
 from pathlib import Path
@@ -381,6 +464,7 @@ from pathlib import Path
 payload = {
   'tenant': ${tenant_name@Q},
   'container': ${container_name@Q},
+  'shortUuid': ${short_uuid@Q},
   'durationLabel': ${duration_label@Q},
   'durationSeconds': int(${duration_seconds@Q}),
   'modelMode': ${model_mode@Q},
@@ -390,6 +474,9 @@ payload = {
   'createdAt': ${created_at@Q},
   'expiresAt': ${expires_at@Q},
   'vncPassword': ${vnc_password@Q},
+  'baseUrl': ${public_base_url@Q},
+  'model': ${public_model@Q},
+  'feishuAppId': ${feishu_app_id@Q},
 }
 proxy_port = ${proxy_port@Q}
 if proxy_port:
@@ -431,6 +518,7 @@ bootstrap_if_missing() {
   mkdir -p "$(dirname "$CONFIG_PATH")"
   mkdir -p "$WORKSPACE"
   mkdir -p "$SKILLS_DIR"
+  mkdir -p "$HOOKS_DIR"
   mkdir -p "$WORKSPACE/memory"
   if [[ ! -f "$WORKSPACE/MEMORY.md" ]]; then
     printf '# MEMORY.md\n\n## Long-term Memory\n\n' > "$WORKSPACE/MEMORY.md"
@@ -634,10 +722,28 @@ hooks['enabled'] = True
 hook_entries = hooks.setdefault('entries', {})
 for name in ('boot-md', 'bootstrap-extra-files', 'command-logger', 'session-memory'):
   hook_entries.setdefault(name, {})['enabled'] = True
+hook_entries.setdefault('memory-preload-bundle', {})['enabled'] = True
+hook_entries['memory-preload-bundle'].setdefault('memoryDbPath', str(Path(workspace) / 'skills' / 'local-long-memory' / 'data' / 'memory.db'))
+hook_entries['memory-preload-bundle'].setdefault('recentMessages', 4)
+hook_entries['memory-preload-bundle'].setdefault('sessionItems', 6)
+hook_entries['memory-preload-bundle'].setdefault('taskItems', 8)
+hook_entries['memory-preload-bundle'].setdefault('searchItems', 6)
+hook_entries['memory-preload-bundle'].setdefault('maxTaskIds', 3)
+hook_entries['memory-preload-bundle'].setdefault('maxChars', 4000)
+hook_entries['memory-preload-bundle'].setdefault('dmOnly', True)
+hook_entries.setdefault('memory-auto-capture', {})['enabled'] = True
+hook_entries['memory-auto-capture'].setdefault('memoryDbPath', str(Path(workspace) / 'skills' / 'local-long-memory' / 'data' / 'memory.db'))
+hook_entries['memory-auto-capture'].setdefault('memoryScriptPath', str(Path(workspace) / 'skills' / 'local-long-memory' / 'scripts' / 'memory_core.py'))
+hook_entries['memory-auto-capture'].setdefault('dmOnly', True)
+hook_entries['memory-auto-capture'].setdefault('maxTextLength', 1200)
+hook_entries['memory-auto-capture'].setdefault('allowSummaryOnCompact', True)
+hook_entries['memory-auto-capture'].setdefault('dedupeWindowSec', 21600)
+hook_entries['memory-auto-capture'].setdefault('maxTaskCandidates', 5)
 skills = cfg.setdefault('skills', {}).setdefault('entries', {})
 skills.setdefault('using-superpowers', {})['enabled'] = True
 skills.setdefault('agile-codex', {})['enabled'] = True
 skills.setdefault('browser-use', {})['enabled'] = True
+skills.setdefault('local-long-memory', {})['enabled'] = True
 gateway = cfg.setdefault('gateway', {})
 gateway['port'] = gateway_port
 gateway['mode'] = 'local'
@@ -698,16 +804,28 @@ EOF
 }
 
 install_local_skills() {
-  if [[ ! -d "$BUNDLED_SKILLS_DIR/using-superpowers" || ! -d "$BUNDLED_SKILLS_DIR/agile-codex" || ! -d "$BUNDLED_SKILLS_DIR/browser-use" ]]; then
+  if [[ ! -d "$BUNDLED_SKILLS_DIR/using-superpowers" || ! -d "$BUNDLED_SKILLS_DIR/agile-codex" || ! -d "$BUNDLED_SKILLS_DIR/browser-use" || ! -d "$BUNDLED_SKILLS_DIR/local-long-memory" ]]; then
     echo "missing bundled skills under $BUNDLED_SKILLS_DIR" >&2
     exit 1
   fi
   mkdir -p "$SKILLS_DIR"
-  rm -rf "$SKILLS_DIR/using-superpowers" "$SKILLS_DIR/agile-codex" "$SKILLS_DIR/browser-use"
+  rm -rf "$SKILLS_DIR/using-superpowers" "$SKILLS_DIR/agile-codex" "$SKILLS_DIR/browser-use" "$SKILLS_DIR/local-long-memory"
   cp -a "$BUNDLED_SKILLS_DIR/using-superpowers" "$SKILLS_DIR/using-superpowers"
   cp -a "$BUNDLED_SKILLS_DIR/agile-codex" "$SKILLS_DIR/agile-codex"
   cp -a "$BUNDLED_SKILLS_DIR/browser-use" "$SKILLS_DIR/browser-use"
+  cp -a "$BUNDLED_SKILLS_DIR/local-long-memory" "$SKILLS_DIR/local-long-memory"
+  mkdir -p "$HOOKS_DIR"
+  rm -rf "$HOOKS_DIR/memory-preload-bundle"
+  rm -rf "$HOOKS_DIR/memory-auto-capture"
+  if [[ -d "$BUNDLED_SKILLS_DIR/local-long-memory/hooks/memory-preload-bundle" ]]; then
+    cp -a "$BUNDLED_SKILLS_DIR/local-long-memory/hooks/memory-preload-bundle" "$HOOKS_DIR/memory-preload-bundle"
+  fi
+  if [[ -d "$BUNDLED_SKILLS_DIR/local-long-memory/hooks/memory-auto-capture" ]]; then
+    cp -a "$BUNDLED_SKILLS_DIR/local-long-memory/hooks/memory-auto-capture" "$HOOKS_DIR/memory-auto-capture"
+  fi
   find "$SKILLS_DIR/agile-codex/scripts" -type f \( -name '*.sh' -o -name '*.py' \) -exec chmod +x {} +
+  find "$SKILLS_DIR/local-long-memory/scripts" -type f \( -name '*.sh' -o -name '*.py' \) -exec chmod +x {} + 2>/dev/null || true
+  find "$SKILLS_DIR/local-long-memory/tests" -type f \( -name '*.sh' -o -name '*.py' \) -exec chmod +x {} + 2>/dev/null || true
   mkdir -p "$AGILE_CODEX_RUNTIME_DIR"
   echo "installed local skills into $SKILLS_DIR"
 }
@@ -826,54 +944,7 @@ setup_tenant_expiry() {
   local container_name="$1"
   local seconds="$2"
   local state_dir="$3"
-  local expiry_log="$state_dir/expiry.log"
-  local expiry_mode_file="$state_dir/expiry.mode"
-  local expiry_unit_file="$state_dir/expiry.unit"
-  mkdir -p "$state_dir"
-  chmod 700 "$state_dir" 2>/dev/null || true
-  printf 'scheduled disable in %ss for %s\n' "$seconds" "$container_name" > "$expiry_log"
-  stop_pid_file "$state_dir/expiry.pid"
-  if [[ -f "$expiry_unit_file" ]] && have_systemd_user; then
-    local old_unit
-    old_unit="$(cat "$expiry_unit_file" 2>/dev/null || true)"
-    if [[ -n "$old_unit" ]]; then
-      systemctl --user stop "${old_unit}.timer" >/dev/null 2>&1 || true
-      systemctl --user stop "${old_unit}.service" >/dev/null 2>&1 || true
-      systemctl --user reset-failed "${old_unit}.timer" "${old_unit}.service" >/dev/null 2>&1 || true
-    fi
-    rm -f "$expiry_unit_file"
-  fi
-  rm -f "$expiry_mode_file"
-  if have_systemd_user && command -v systemd-run >/dev/null 2>&1; then
-    local systemd_unit
-    systemd_unit="openclaw-tenant-expire-$(systemd_unit_key "$container_name")"
-    if systemd-run --user \
-      --unit "$systemd_unit" \
-      --on-active "${seconds}s" \
-      --timer-property=AccuracySec=1s \
-      --collect \
-      bash \
-      "$SCRIPT_DIR/scripts/tenant-expire.sh" \
-      "$container_name" \
-      "0" \
-      "$state_dir" >"$state_dir/expiry-schedule.log" 2>&1; then
-      printf 'systemd-user\n' > "$expiry_mode_file"
-      printf '%s\n' "$systemd_unit" > "$expiry_unit_file"
-      return 0
-    fi
-    printf 'systemd-run failed, fallback to detached sleep\n' >> "$expiry_log"
-  fi
-  local expiry_cmd expiry_pid
-  printf -v expiry_cmd '%q %q %q %q %q > %q 2>&1' \
-    "bash" \
-    "$SCRIPT_DIR/scripts/tenant-expire.sh" \
-    "$container_name" \
-    "$seconds" \
-    "$state_dir" \
-    "$state_dir/expiry-run.log"
-  expiry_pid="$(spawn_detached "$expiry_cmd")"
-  echo "$expiry_pid" > "$state_dir/expiry.pid"
-  printf 'sleep-fallback\n' > "$expiry_mode_file"
+  bash "$SCRIPT_DIR/scripts/tenant-schedule-expiry.sh" "$container_name" "$seconds" "$state_dir"
 }
 
 run_tenant_mode() {
@@ -883,15 +954,30 @@ run_tenant_mode() {
     echo 'docker compose not available' >&2
     exit 1
   }
-  local duration_label duration_seconds model_mode tenant_name tenant_container tenant_gateway_port tenant_vnc_port tenant_data_dir tenant_state_dir tenant_proxy_token tenant_proxy_port tenant_vnc_password host_base host_key host_model effective_base effective_key effective_model tenant_allowed_origins_json created_at expires_at expiry_mode expiry_unit
+  local duration_label duration_seconds model_mode tenant_short_uuid tenant_name tenant_container tenant_gateway_port tenant_vnc_port tenant_data_dir tenant_state_dir tenant_proxy_token tenant_proxy_port tenant_vnc_password host_base host_key host_model effective_base effective_key effective_model tenant_allowed_origins_json created_at expires_at expiry_mode expiry_unit
   duration_label="$(choose_tenant_duration)"
   duration_seconds="$(tenant_duration_seconds "$duration_label")"
   model_mode="$(choose_tenant_model_mode)"
-  tenant_name="tenant-$(date -u +%Y%m%d%H%M%S)-$(python3 - <<'PY'
+  tenant_short_uuid="$(python3 - "$TENANT_SHORT_UUID" <<'PY'
+import re
 import secrets
-print(secrets.token_hex(2))
+import sys
+
+candidate = (sys.argv[1] or '').strip().lower()
+if candidate:
+    candidate = re.sub(r'[^a-z0-9]', '', candidate)
+    if len(candidate) < 4:
+        raise SystemExit('tenant short uuid must be at least 4 lowercase alphanumeric characters')
+else:
+    candidate = secrets.token_hex(4)
+print(candidate)
 PY
 )"
+  if [[ -z "$tenant_short_uuid" ]]; then
+    echo "failed to derive tenant short uuid" >&2
+    return 1
+  fi
+  tenant_name="tenant-$(date -u +%Y%m%d%H%M%S)-${tenant_short_uuid}"
   tenant_container="${tenant_name}-openclaw"
   tenant_gateway_port="$(find_free_port)"
   tenant_vnc_port="$(find_free_port)"
@@ -979,6 +1065,7 @@ PY
     "$tenant_state_dir/tenant.json" \
     "$tenant_name" \
     "$tenant_container" \
+    "$tenant_short_uuid" \
     "$duration_label" \
     "$duration_seconds" \
     "$model_mode" \
@@ -990,10 +1077,14 @@ PY
     "$expires_at" \
     "$tenant_vnc_password" \
     "$expiry_mode" \
-    "$expiry_unit"
+    "$expiry_unit" \
+    "$effective_base" \
+    "$effective_model" \
+    "$tenant_feishu_app_id"
 
   cat <<EOF
 租户模式已启动。
+- short uuid: $tenant_short_uuid
 - tenant: $tenant_name
 - container: $tenant_container
 - gateway ws port: $tenant_gateway_port
@@ -1236,6 +1327,7 @@ print(json.dumps({
   'using-superpowers': cfg.get('skills',{}).get('entries',{}).get('using-superpowers',{}).get('enabled'),
   'agile-codex': cfg.get('skills',{}).get('entries',{}).get('agile-codex',{}).get('enabled'),
   'browser-use': cfg.get('skills',{}).get('entries',{}).get('browser-use',{}).get('enabled'),
+  'local-long-memory': cfg.get('skills',{}).get('entries',{}).get('local-long-memory',{}).get('enabled'),
   'skillsDirExists': Path(${SKILLS_DIR@Q}).exists(),
   'agileCodexPlatform': platform,
   'feishu': {
@@ -1252,7 +1344,11 @@ PY
   test -f "$SKILLS_DIR/using-superpowers/SKILL.md"
   test -f "$SKILLS_DIR/agile-codex/SKILL.md"
   test -f "$SKILLS_DIR/browser-use/SKILL.md"
+  test -f "$SKILLS_DIR/local-long-memory/SKILL.md"
   test -f "$SKILLS_DIR/agile-codex/scripts/agile_codex_backend.py"
+  test -f "$SKILLS_DIR/local-long-memory/scripts/memory_core.py"
+  test -f "$HOOKS_DIR/memory-preload-bundle/HOOK.md"
+  test -f "$HOOKS_DIR/memory-auto-capture/HOOK.md"
   openclaw agent --agent main -m "Reply with exactly INSTALLER_SMOKE_OK and nothing else." --json --timeout 60 >/tmp/openclaw-native-smoke.json 2>&1 || true
   tail -n 40 /tmp/openclaw-native-smoke.json
   openclaw cron list --json >/tmp/openclaw-native-cron.json 2>&1 || true
